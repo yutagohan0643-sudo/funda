@@ -3,7 +3,7 @@
 使い方（リポジトリの一番上で）:
   python tools/disclosures.py fetch 2334   # 会社の IR ページから開示一覧を取り直し、まだ分析のない開示を表示
   python tools/disclosures.py text 2334 GUID  # その開示の PDF を読み、本文の先頭を表示
-  python tools/disclosures.py build 2334   # data/2334/ のデータから 2334_開示.md を作り直す
+  python tools/disclosures.py build 2334   # data/2334/ のデータから 2334_開示.md とテーマ別ファイルを作り直す
 
 データ（data/コード/）:
   items.json    開示の一覧（日付・種類・表題・URL）
@@ -11,6 +11,7 @@
   stars.txt     流れを変えた重要な開示（★を付ける guid）
   head.md       ファイル前半の「開示から見えたこと」（年表・業績・資金調達・関係者）
   source.json   開示一覧の取り方（今は eir-parts の IR 配信のみ）
+  topics.json   テーマ別ファイルの設定（表題か分析に pattern が当たる開示＋include を集め、exclude を除く）
 """
 
 from __future__ import annotations
@@ -102,8 +103,21 @@ def cmd_build(code: str) -> None:
     d = ddir(code)
     items = load_items(code)
     com = load_comments(code)
+    write_list(code, items, com, d / 'head.md', ROOT / f'{code}_開示.md', '全開示一覧（新しい順）')
+    # テーマ別のファイル（data/コード/topics.json）
+    tp = d / 'topics.json'
+    for t in json.loads(tp.read_text()) if tp.exists() else []:
+        pat = re.compile(t['pattern'])
+        inc, exc = set(t.get('include', [])), set(t.get('exclude', []))
+        sel = [x for x in items if x['guid'] not in exc and (
+            x['guid'] in inc or pat.search(x['title']) or pat.search(com.get(x['guid'], '')))]
+        write_list(code, sel, com, d / t['head'], ROOT / t['file'], '開示一覧（新しい順）')
+
+
+def write_list(code: str, items: list[dict], com: dict[str, str], head: Path, out: Path, heading: str) -> None:
+    d = ddir(code)
     stars = set((d / 'stars.txt').read_text().split()) if (d / 'stars.txt').exists() else set()
-    lines = [(d / 'head.md').read_text().rstrip(), '', '## 全開示一覧（新しい順）', '',
+    lines = [head.read_text().rstrip(), '', f'## {heading}', '',
              '★ は流れを変えた重要な開示。「分析」は開示本文を読んだうえでのひとこと（定型の書類は種類ごとの説明）。', '']
     by = collections.defaultdict(list)
     for x in items:
@@ -121,7 +135,6 @@ def cmd_build(code: str) -> None:
             st = '★' if x['guid'] in stars else ''
             lines.append(f"| {x['date'][5:10]} | {KIND.get(x['news_type'], x['news_type'])} | {st}[{t}]({x['link']}) | {c.replace('|', '／')} |")
         lines.append('')
-    out = ROOT / f'{code}_開示.md'
     out.write_text('\n'.join(lines) + '\n')
     print(f'{out.name}: {len(items)}件（分析なし {missing}件）')
 
