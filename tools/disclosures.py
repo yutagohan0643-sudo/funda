@@ -10,19 +10,21 @@
   comments.tsv  1件ずつの分析（guid<TAB>分析）。新しい開示はここに1行足す
   stars.txt     流れを変えた重要な開示（★を付ける guid）
   head.md       ファイル前半の「開示から見えたこと」（年表・業績・資金調達・関係者）
-  source.json   開示一覧の取り方（今は eir-parts の IR 配信のみ）
+  source.json   開示一覧の取り方。type: eirparts（feed）／irpocket（code）／html（pages: [{url, category, pdf_only}]）
   topics.json   テーマ別ファイルの設定（表題か分析に pattern が当たる開示＋include を集め、exclude を除く）
 """
 
 from __future__ import annotations
 
 import collections
+import hashlib
 import json
 import re
 import subprocess
 import sys
 import tempfile
 import unicodedata
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -54,13 +56,90 @@ def load_comments(code: str) -> dict[str, str]:
     return out
 
 
+def _get(url: str) -> bytes:
+    with urllib.request.urlopen(urllib.request.Request(url, headers=UA), timeout=60) as r:
+        return r.read()
+
+
+def _kind_from(cat: str, title: str) -> str:
+    """配信元の分類名と表題から、このリポジトリの種類（news_type）を決める"""
+    t = title
+    if re.search(r'決算短信', t) and not re.search(r'訂正|説明|補足|を掲載', t):
+        return 'tanshin'
+    if re.search(r'を掲載しました', t):
+        return 'ir_material_for_fiscal_ym'
+    if re.search(r'業績予想|配当|自己株式|自社株|株式報酬|買収防衛|役員の異動|代表取締役|特別(?:利益|損失)|計上に関する|減損|主要株主|株式分割|新株|第三者割当|公開買付|資本業務提携|業務提携|子会社|株式取得|事業譲|訴訟|インシデント|不正|中期経営計画.*修正', t):
+        return 'press'
+    if False:
+        return 'tanshin'
+    if re.search(r'有価証券報告書|四半期報告書|半期報告書|内部統制報告書|臨時報告書|確認書', t) or cat in ('有価証券報告書', '法定開示'):
+        return 'yuho'
+    if re.search(r'招集|株主総会|決議ご?通知', t) or cat == '株主総会':
+        return 'gms'
+    if re.search(r'コーポレート・?ガバナンス', t):
+        return 'cgr_ds'
+    if cat in ('IR資料', '決算説明資料') or re.search(r'説明資料|補足|説明会|プレゼンテーション|中期経営計画|成長可能性|統合報告|アニュアル|レポート|書き起こし', t):
+        return 'ir_material_for_fiscal_ym'
+    if cat in ('PR情報', 'お知らせ', 'ニュース', 'プレスリリース', 'topics'):
+        return 'pr'
+    return 'press'
+
+
 def fetch_feed(code: str) -> list[dict]:
     src = json.loads((ddir(code) / 'source.json').read_text())
-    url = src['feed']
-    with urllib.request.urlopen(urllib.request.Request(url, headers=UA), timeout=60) as r:
-        s = r.read().decode('utf-8-sig')
-    d = json.loads(s[s.index('(') + 1:s.rindex(')')])
-    return [{k: x.get(k, '') for k in KEEP} for x in d['item']]
+    typ = src.get('type', 'eirparts')
+    if typ == 'eirparts':
+        s = _get(src['feed']).decode('utf-8-sig')
+        d = json.loads(s[s.index('(') + 1:s.rindex(')')])
+        return [{k: x.get(k, '') for k in KEEP} for x in d['item']]
+    if typ == 'irpocket':  # IR Pocket（例: サイバートラスト）
+        s = _get(f"https://xml.irpocket.com/{src['code']}/JS/release-all-all.js").decode('utf-8')
+        d = json.loads(s[s.index('(') + 1:s.rindex(')')])
+        out = []
+        for x in d['item']:
+            link = x.get('link', '')
+            link = 'https:' + link if link.startswith('//') else link
+            out.append({'guid': 'irp_' + x['id'], 'date': x['published'].replace('-', '/') + ('' if x['published'].count(':') == 2 else ':00'),
+                        'title': x['title'].strip(), 'link': link, 'news_type': _kind_from(x.get('category_name', ''), x['title']),
+                        'type': 'pdf' if link.lower().endswith('.pdf') else 'url'})
+        return out
+    if typ == 'html':  # 会社の IR ページを読む（日付と PDF のリンクを拾う）
+        out, seen = [], set()
+        for page in src['pages']:
+            url, cat = page['url'], page.get('category', '')
+            h = _get(url).decode('utf-8', 'ignore')
+            # <dt>2026.11.13</dt><dd><a href="x.pdf">表題</a> 型と、<a href="x.pdf"><p>2026年11月13日</p><p>表題</p></a> 型
+            pat = re.compile(r'(\d{4})[./年](\d{1,2})[./月](\d{1,2})日?\s*(?:</[^>]+>\s*)*(?:<[^>]+>\s*)*?<a[^>]+href="([^"]+)"[^>]*>(.*?)</a>'
+                             r'|<a[^>]+href="([^"]+)"[^>]*>\s*(?:<[^>]+>\s*)*(\d{4})年(\d{1,2})月(\d{1,2})日(.*?)</a>'
+                             r'|<a[^>]+href="([^"]+\.pdf)"[^>]*>(.*?)</a>', re.S)
+            for m in pat.finditer(h):
+                if m.group(4):
+                    y, mo, da, link, title = m.group(1), m.group(2), m.group(3), m.group(4), m.group(5)
+                elif m.group(6):
+                    link, y, mo, da, title = m.group(6), m.group(7), m.group(8), m.group(9), m.group(10)
+                else:
+                    link, title = m.group(11), m.group(12)
+                    um = re.search(r'/uploads/(\d{4})/(\d{2})/', link)
+                    fm = re.search(r'(20\d{2})(\d{2})(\d{2})', link.rsplit('/', 1)[-1])
+                    if fm:
+                        y, mo, da = fm.groups()
+                    elif um:
+                        y, mo, da = um.group(1), um.group(2), '00'
+                    else:
+                        continue
+                title = re.sub(r'<[^>]+>', ' ', title)
+                title = re.sub(r'\s+', ' ', title).strip()
+                if not title or link in seen:
+                    continue
+                if page.get('pdf_only') and not link.lower().endswith('.pdf'):
+                    continue
+                link = urllib.parse.urljoin(url, link)
+                seen.add(link)
+                gid = 'h_' + hashlib.md5(link.encode()).hexdigest()[:12]
+                out.append({'guid': gid, 'date': f'{y}/{int(mo):02d}/{int(da):02d} 00:00:00', 'title': title, 'link': link,
+                            'news_type': _kind_from(cat, title), 'type': 'pdf' if link.lower().endswith('.pdf') else 'url'})
+        return out
+    raise SystemExit(f'不明な source.type: {typ}')
 
 
 def cmd_fetch(code: str) -> None:
