@@ -1,19 +1,22 @@
-"""株価目線の候補探し。TDnet の全銘柄の開示 × 株価の反応から、3つのタイプを拾う。
+"""材料の中身から候補を探す。TDnet の全銘柄の開示を読み、材料そのものの大きさで3つのタイプを拾う（株価の動きは見ない）。
 
-  A. 企業再評価      中計・資本コスト・還元方針・事業の組み替えなどの開示のあと、株価が市場より強い
-  B. 好決算なのに売られた  決算短信で営業増益（＋予想も増益 or 上方修正）なのに、発表後に市場より弱い
-  C. 大きな思惑      AI・提携・受注・TOB などの開示で、出来高を伴って大きく上がった（PER は問わない）
+  A. 企業再評価      中計・資本コスト・還元方針・事業の組み替え・自社株買い。自社株買いは取得株数の割合で大きさを見る
+  B. 決算・業績が非常に良い  業績予想の上方修正（XBRL の前回予想→今回予想）と、決算短信の増益率・通期予想への進捗
+  C. 大きな材料      受注・契約・提携・買収・承認など。本文の金額 ÷ 年間売上で大きさを見る
 
 使い方（リポジトリの一番上で）:
-  python tools/candidates.py            # 直近 21 日の開示で候補を出す → candidates/YYYY-MM-DD.md
+  python tools/candidates.py            # 直近 21 日の開示 → candidates/YYYY-MM-DD.md（機械的な一覧）
   python tools/candidates.py --days 31  # TDnet に残っているのは約1か月分
+  一覧の上位は本文を読み、candidates/YYYY-MM-DD_分析.md に人の頭で評価を書く
 
-データ: TDnet 適時開示一覧（www.release.tdnet.info）、決算短信 XBRL サマリー、JPX 上場銘柄一覧、Yahoo Finance（株価・時価総額）
+データ: TDnet 適時開示一覧と PDF・XBRL（www.release.tdnet.info）、JPX 上場銘柄一覧、Yahoo Finance（時価総額だけ）
 キャッシュ: cache/（git に入れない）
 """
 from __future__ import annotations
 
 import argparse
+import subprocess
+import tempfile
 import io
 import json
 import re
@@ -33,7 +36,6 @@ CACHE = ROOT / 'cache'
 TDNET = 'https://www.release.tdnet.info/inbs/'
 JPX_LIST = 'https://www.jpx.co.jp/markets/statistics-equities/misc/tvdivq0000001vg2-att/data_j.xlsx'
 UA = {'User-Agent': 'Mozilla/5.0 (funda candidates)'}
-CLOSE_HHMM = '15:30'  # 東証の大引け（2024/11〜）。これ以降の開示は翌営業日から反応
 
 # ---- 開示の分類（表題の正規表現） ----
 RERATE = re.compile(
@@ -52,7 +54,7 @@ TOB_TARGET = re.compile(r'当社株式.*公開買付け|公開買付け.*賛同|
 # 再評価のなかでも「本気度」が高い開示（自社株買い・分割・優待より重く見る）
 RERATE_STRONG = re.compile(r'中期経営計画|中期経営方針|長期ビジョン|資本コストや株価を意識|資本収益性|株主還元方針|配当方針|'
                            r'累進配当|DOE|事業ポートフォリオ|政策保有株式|市場区分の変更|プライム市場への|持株会社体制|'
-                           r'商号|資本業務提携|親会社等の異動|主要株主.*異動')
+                           r'商号|資本業務提携')
 BUYBACK = re.compile(r'自己株式')
 # 定型の開示（材料になりにくい）
 ROUTINE = re.compile(r'決算短信|説明資料|説明会|招集|株主総会|ガバナンス|自己株式|役員|人事|定款|異動|月次|'
@@ -123,11 +125,40 @@ def tdnet(days: int) -> pd.DataFrame:
     return pd.DataFrame(out)
 
 
-# ---------------- 決算短信 XBRL サマリー ----------------
+# ---------------- XBRL ----------------
+FACT = re.compile(r'<ix:nonFraction([^>]*?)(?:/>|>(.*?)</ix:nonFraction>)', re.S)
+
+
+def xbrl_facts(url: str) -> dict:
+    """XBRL サマリーの数値を {名前|コンテキスト: 値} で返す（空欄の値は飛ばす）"""
+    key = re.sub(r'\W', '', url.rsplit('/', 1)[-1])
+    p = CACHE / 'xbrl2' / f'{key}.json'
+    if p.exists():
+        return json.loads(p.read_text())
+    out = {}
+    try:
+        z = zipfile.ZipFile(io.BytesIO(_get(url)))
+        names = [n for n in z.namelist() if n.endswith('-ixbrl.htm') and ('/Summary/' in n or 'rvfc' in n or 'rvdf' in n)]
+        for n in names:
+            h = z.read(n).decode('utf-8', 'ignore')
+            for m in FACT.finditer(h):
+                a, body = m.group(1), m.group(2)
+                if body is None or 'xsi:nil="true"' in a:
+                    continue
+                nm = re.search(r'name="[^:"]+:([^"]+)"', a)
+                cx = re.search(r'contextRef="([^"]+)"', a)
+                v = _num(a, body)
+                if nm and cx and v is not None:
+                    out[f'{nm.group(1)}|{cx.group(1)}'] = v
+    except Exception as e:  # noqa: BLE001
+        out = {'_error': str(e)[:80]}
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(out))
+    return out
+
+
 def _num(a: str, body: str) -> float | None:
     v = _clean(body).replace(',', '')
-    if not v or v in '-－':
-        return None
     try:
         x = float(v)
     except ValueError:
@@ -137,48 +168,122 @@ def _num(a: str, body: str) -> float | None:
     return -x if 'sign="-"' in a else x
 
 
-def xbrl_summary(url: str) -> dict:
-    """営業利益（累計）・前年比・通期予想の前年比を取り出す。連結を優先、なければ単体"""
-    key = re.sub(r'\W', '', url.rsplit('/', 1)[-1])
-    p = CACHE / 'xbrl' / f'{key}.json'
-    if p.exists():
-        return json.loads(p.read_text())
-    out: dict = {}
-    try:
-        z = zipfile.ZipFile(io.BytesIO(_get(url)))
-        name = next(n for n in z.namelist() if '/Summary/' in n and n.endswith('-ixbrl.htm'))
-        h = z.read(name).decode('utf-8', 'ignore')
-        vals = {}
-        for m in re.finditer(r'<ix:nonFraction([^>]*)>(.*?)</ix:nonFraction>', h, re.S):
-            a = m.group(1)
-            n = re.search(r'name="[^:"]+:([^"]+)"', a)
-            c = re.search(r'contextRef="([^"]+)"', a)
-            if n and c:
-                vals[(n.group(1), c.group(1))] = _num(a, m.group(2))
-        for scope in ('ConsolidatedMember', 'NonConsolidatedMember'):
-            cur = [c for (n, c) in vals if n == 'OperatingIncome' and c.startswith('Current') and
-                   scope in c and 'ResultMember' in c and c.split('_')[1] == scope]
-            if not cur:
-                continue
-            ctx = cur[0]
-            prior = ctx.replace('Current', 'Prior', 1)
-            fc = f'CurrentYearDuration_{scope}_ForecastMember' if 'Year' not in ctx.split('_')[0] else f'NextYearDuration_{scope}_ForecastMember'
-            g = lambda n, c: vals.get((n, c))
-            out = {'period': ctx.split('_')[0].replace('CurrentAccumulated', '').replace('Duration', ''),
-                   'sales': g('NetSales', ctx), 'op': g('OperatingIncome', ctx), 'op_prior': g('OperatingIncome', prior),
-                   'op_yoy': g('ChangeInOperatingIncome', ctx), 'sales_yoy': g('ChangeInNetSales', ctx),
-                   'op_fc': g('OperatingIncome', fc), 'op_fc_yoy': g('ChangeInOperatingIncome', fc)}
-            if out['op_yoy'] is None and out['op'] and out['op_prior'] and out['op_prior'] > 0:
-                out['op_yoy'] = out['op'] / out['op_prior'] - 1
-            break
-    except Exception as e:  # noqa: BLE001
-        out = {'error': str(e)[:80]}
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(out))
+def _scope(f: dict) -> str:
+    return 'ConsolidatedMember' if any('_ConsolidatedMember' in k for k in f) else 'NonConsolidatedMember'
+
+
+def tanshin_metrics(f: dict) -> dict:
+    """決算短信: 累計の売上・営業利益と前年比、通期予想と前年比、通期予想への進捗"""
+    sc = _scope(f)
+    cur = sorted({k.split('|')[1] for k in f if k.startswith('OperatingIncome|Current') and f'_{sc}_' in k + '_'
+                  and 'ResultMember' in k})
+    if not cur:
+        return {}
+    ctx = cur[0]
+    period = ctx.split('_')[0]
+    annual = 'Year' in period and 'Accumulated' not in period
+    fc = f'{"NextYearDuration" if annual else "CurrentYearDuration"}_{sc}_ForecastMember'
+    g = lambda n, c: f.get(f'{n}|{c}')
+    op, op_p = g('OperatingIncome', ctx), g('OperatingIncome', ctx.replace('Current', 'Prior', 1))
+    yoy = g('ChangeInOperatingIncome', ctx)
+    if yoy is None and op is not None and op_p and op_p > 0:
+        yoy = op / op_p - 1
+    fop = g('OperatingIncome', fc)
+    q = re.search(r'Q(\d)', period)
+    return {'期': '通期' if annual else (f'{q.group(1)}Q累計' if q else period),
+            '売上': g('NetSales', ctx), '営業益': op, '営業益_前年': op_p, '営業益_前年比': yoy,
+            '売上_前年比': g('ChangeInNetSales', ctx), '予想売上': g('NetSales', fc), '予想営業益': fop,
+            '予想営業益_前年比': g('ChangeInOperatingIncome', fc),
+            '進捗': (op / fop) if (op and fop and fop > 0 and not annual) else None,
+            '標準進捗': (int(q.group(1)) / 4) if (q and not annual) else None}
+
+
+def revision_metrics(f: dict) -> dict:
+    """業績予想の修正: 前回予想 → 今回予想（レンジ予想は中央値）"""
+    sc = _scope(f)
+    def val(name, which):
+        base = f'CurrentYearDuration_{sc}_{which}Member'
+        v = f.get(f'{name}|{base}_ForecastMember')
+        if v is None:
+            lo, hi = f.get(f'{name}|{base}_LowerMember'), f.get(f'{name}|{base}_UpperMember')
+            v = (lo + hi) / 2 if lo is not None and hi is not None else None
+        return v
+    out = {}
+    for name, jp in (('NetSales', '売上'), ('OperatingIncome', '営業益'), ('OrdinaryIncome', '経常益'),
+                     ('ProfitAttributableToOwnersOfParent', '純利益'), ('ProfitAttributableToOwners', '純利益')):
+        a, b = val(name, 'Previous'), val(name, 'Current')
+        if b is None or jp + '_今回' in out:
+            continue
+        out[f'{jp}_前回'], out[f'{jp}_今回'] = a, b
+        out[f'{jp}_修正率'] = (b / a - 1) if (a and a > 0) else None
+        prior = f.get(f'{name}|PriorYearDuration_{sc}_CurrentMember_ResultMember') or \
+            f.get(f'{name}|PriorYearDuration_{sc}_ResultMember')
+        out[f'{jp}_前期'] = prior
     return out
 
 
-# ---------------- 銘柄・株価 ----------------
+# ---------------- PDF 本文 ----------------
+def pdf_text(url: str, pages: int = 3) -> str:
+    key = re.sub(r'\W', '', url.rsplit('/', 1)[-1])
+    p = CACHE / 'text' / f'{key}.txt'
+    if p.exists():
+        return p.read_text()
+    try:
+        raw = _get(url)
+        with tempfile.NamedTemporaryFile(suffix='.pdf') as tf:
+            tf.write(raw)
+            tf.flush()
+            txt = subprocess.run(['pdftotext', '-l', str(pages), '-layout', tf.name, '-'],
+                                 capture_output=True, text=True, timeout=60).stdout
+    except Exception:  # noqa: BLE001
+        txt = ''
+    txt = unicodedata.normalize('NFKC', txt)
+    txt = re.sub(r'[ \t\u3000]+', ' ', txt)
+    txt = re.sub(r'\n\s*\n+', '\n', txt)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(txt)
+    return txt
+
+
+AMOUNT = re.compile(r'(?:約|総額|合計)?\s*([0-9][0-9,]*(?:\.[0-9]+)?)\s*(兆|億|百万|千)\s*円')
+UNIT = {'兆': 1e12, '億': 1e8, '百万': 1e6, '千': 1e3}
+KEY_AMOUNT = re.compile(r'受注(?:金額|額|高)|契約(?:金額|総額)|取得価額|取得価格|取得金額|譲受価額|譲渡価額|買収金額|'
+                        r'取得総額|取得価額の総額|調達|払込金額の総額|出資(?:金額|額)|投資(?:金額|額)|事業規模|総額')
+SHARE_RATIO = re.compile(r'(?:発行済株式総数|自己株式を除く)[^\n%]{0,40}?(?:割合|比率)?[^\n%]{0,10}?([0-9]+(?:\.[0-9]+)?)\s*%')
+
+
+def amounts(txt: str) -> tuple[float | None, str]:
+    """本文から材料の金額を取る。受注金額・取得価額などの行を優先。概要表（資本金・総資産など）は除く"""
+    best, line_best = None, ''
+    for line in txt.splitlines():
+        if re.search(r'資本金|総資産|純資産|売上高|営業利益|経常利益|当期純利益|大株主|資本準備金', line):
+            continue
+        if not KEY_AMOUNT.search(line):
+            continue
+        for m in AMOUNT.finditer(line):
+            v = float(m.group(1).replace(',', '')) * UNIT[m.group(2)]
+            if best is None or v > best:
+                best, line_best = v, line.strip()[:80]
+    return best, line_best
+
+
+def excerpt(txt: str, n: int = 220) -> str:
+    body = txt.split('記', 1)[1] if '\n記\n' in txt else txt
+    body = re.sub(r'\s+', ' ', body)
+    return body[:n]
+
+
+REVISION = re.compile(r'業績予想.*修正|予想の修正|上方修正|業績予想と実績値')
+DIVIDEND = re.compile(r'配当予想の修正|増配|配当方針|記念配当|特別配当')
+DOWN = re.compile(r'下方修正|減配|無配|損失|赤字|減損')
+# お金の手当て（借入・増資）は材料ではない。ただし「提携」を含むものは残す
+FINANCE = re.compile(r'借入|ローン|コミットメント|当座貸越|社債|優先株式|新株予約権|第三者割当|売出し|上場承認|'
+                     r'担保|保証|リース契約|資金の借|金銭消費貸借')
+MIN_OP = 2e8  # 営業利益がこれ未満の会社は、増益率が大きくても材料として小さい
+MATERIAL = re.compile(r'受注|契約|提携|共同開発|ライセンス|承認|採択|特許|子会社化|株式(?:の)?取得|事業の譲受|買収|'
+                      r'合弁|出資|新規事業|参入|量産|販売開始|上市|AI|ＡＩ|データセンター|半導体|宇宙|防衛|量子|ロボット|暗号資産', re.I)
+
+
 def jpx_list() -> pd.DataFrame:
     p = CACHE / 'data_j.xlsx'
     if not p.exists() or time.time() - p.stat().st_mtime > 7 * 86400:
@@ -189,21 +294,6 @@ def jpx_list() -> pd.DataFrame:
     return pd.DataFrame({'code': df['コード'].str.strip(), '社名': df['銘柄名'],
                          '市場': df['市場・商品区分'].str.replace('（内国株式）', '', regex=False),
                          '業種': df['33業種区分']})
-
-
-def prices(codes: list[str]) -> tuple[pd.DataFrame, pd.DataFrame]:
-    syms = [f'{c}.T' for c in codes] + ['1306.T']
-    closes, vols = [], []
-    for i in range(0, len(syms), 200):
-        d = yf.download(syms[i:i + 200], period='1y', interval='1d', auto_adjust=True,
-                        group_by='column', progress=False, threads=True)
-        closes.append(d['Close'])
-        vols.append(d['Volume'])
-    c = pd.concat(closes, axis=1)
-    v = pd.concat(vols, axis=1)
-    c.columns = [x.replace('.T', '') for x in c.columns]
-    v.columns = [x.replace('.T', '') for x in v.columns]
-    return c.loc[:, ~c.columns.duplicated()], v.loc[:, ~v.columns.duplicated()]
 
 
 def mcaps() -> pd.Series:
@@ -221,114 +311,139 @@ def mcaps() -> pd.Series:
     return pd.DataFrame(rows).drop_duplicates('code').set_index('code')
 
 
-def reaction(ev: pd.DataFrame, close: pd.DataFrame, vol: pd.DataFrame) -> pd.DataFrame:
-    """開示の直前の終値を基準に、今日までの騰落・市場（TOPIX連動 ETF）との差・最大上昇・出来高の倍率"""
-    idx = close.index.tz_localize(None) if close.index.tz is not None else close.index
-    close.index, vol.index = idx, idx
-    topix = close['1306']
-    out = []
-    for r in ev.itertuples():
-        if r.code not in close.columns:
-            out.append({})
-            continue
-        d = pd.Timestamp(r.date)
-        after_close = r.time >= CLOSE_HHMM
-        base_i = idx.searchsorted(d, side='right') - (0 if after_close else 1) - 1
-        if base_i < 60 or base_i >= len(idx) - 1:
-            out.append({})
-            continue
-        s, ts, vs = close[r.code], topix, vol[r.code]
-        b, tb = s.iloc[base_i], ts.iloc[base_i]
-        post = s.iloc[base_i + 1:]
-        if pd.isna(b) or post.dropna().empty:
-            out.append({})
-            continue
-        last = post.dropna().iloc[-1]
-        v_pre = vs.iloc[base_i - 60:base_i].mean()
-        out.append({'基準日': idx[base_i].date(), '株価': last, '騰落': last / b - 1,
-                    '対TOPIX': (last / b - 1) - (ts.dropna().iloc[-1] / tb - 1),
-                    '最大上昇': post.max() / b - 1, '初日': post.iloc[0] / b - 1,
-                    '出来高倍率': (vs.iloc[base_i + 1:base_i + 6].mean() / v_pre) if v_pre else None,
-                    '200日線比': last / s.iloc[max(0, base_i - 200):base_i].mean() - 1})
-    return pd.concat([ev.reset_index(drop=True), pd.DataFrame(out)], axis=1)
 
-
-# ---------------- 3タイプの判定 ----------------
-def pick(ev: pd.DataFrame, min_mcap: float, max_mcap: float) -> dict[str, pd.DataFrame]:
-    ev = ev[ev['mcap'].fillna(0).between(min_mcap, max_mcap)].dropna(subset=['騰落'])
-    tob = set(ev.loc[ev['title'].str.contains(TOB_TARGET), 'code'])  # 期間内に TOB 等の対象になった会社は全部外す
-    ev = ev[~ev['code'].isin(tob)]
+# ---------------- 材料の評価 ----------------
+def evaluate(ev: pd.DataFrame, workers: int = 6) -> dict[str, pd.DataFrame]:
     t = ev['title']
-    res = {}
+    common = ~t.str.contains(SKIP_TITLE)
+    # 年間売上（材料の大きさの物差し）: 期間内の決算短信の通期予想売上 → 業績修正の今回予想売上
+    sales = {}
 
-    # B. 好決算なのに売られた
-    b = ev[t.str.contains(TANSHIN) & ~t.str.contains(SKIP_TITLE) & (ev['xbrl'] != '')].copy()
-    up = set(ev.loc[t.str.contains(UPREV), 'code'])
-    b['上方修正等'] = b['code'].isin(up)
-    good = (b['op'] > 0) & (b['op_yoy'] >= 0.20) & ((b['op_fc_yoy'].fillna(0) >= 0) | b['上方修正等'])
-    b = b[good & (b['対TOPIX'] <= -0.05)].copy()
-    b['点'] = b['op_yoy'].clip(upper=2.0).rank(pct=True) + (-b['対TOPIX']).rank(pct=True) + b['上方修正等'] * 0.3
-    res['B'] = b.sort_values('点', ascending=False).drop_duplicates('code')
+    # --- B. 決算・業績 ---
+    tan = ev[t.str.contains(TANSHIN) & common & (ev['xbrl'] != '')]
+    rev = ev[t.str.contains(REVISION) & common & (ev['xbrl'] != '') & ~t.str.contains(TANSHIN)]
+    with ThreadPoolExecutor(workers) as ex:
+        tf = dict(zip(tan.index, ex.map(xbrl_facts, tan['xbrl'])))
+        rf = dict(zip(rev.index, ex.map(xbrl_facts, rev['xbrl'])))
+    T = pd.DataFrame({i: tanshin_metrics(f) for i, f in tf.items()}).T
+    R = pd.DataFrame({i: revision_metrics(f) for i, f in rf.items()}).T
+    for i, r in T.iterrows():
+        if pd.notna(r.get('予想売上')):
+            sales.setdefault(ev.at[i, 'code'], r['予想売上'])
+    for i, r in R.iterrows():
+        if pd.notna(r.get('売上_今回')):
+            sales.setdefault(ev.at[i, 'code'], r['売上_今回'])
 
-    # A. 企業再評価
-    a = ev[t.str.contains(RERATE) & ~t.str.contains(TOB_TARGET) & ~t.str.contains(SKIP_TITLE)].copy()
-    a = a[(a['対TOPIX'] >= 0.05) & (a['200日線比'] > 0)]
+    b_rev = ev.loc[R.index].join(R) if len(R) else ev.iloc[0:0]
+    if len(b_rev):
+        b_rev = b_rev[(b_rev['営業益_修正率'] >= 0.10) & (b_rev['営業益_今回'] >= MIN_OP)].copy()
+        b_rev['種類'] = '上方修正'
+        b_rev['大きさ'] = b_rev['営業益_修正率'].clip(upper=2) * 1.2
+    b_tan = ev.loc[T.index].join(T) if len(T) else ev.iloc[0:0]
+    if len(b_tan):
+        lead = (b_tan['進捗'] - b_tan['標準進捗']).astype(float)
+        b_tan['進捗の上乗せ'] = lead
+        # 会社予想が前年より大きく減益のまま、進捗だけ高い = 予想が古い・保守的（上方修正の余地）
+        b_tan['予想が保守的'] = (lead >= 0.20) & (b_tan['予想営業益_前年比'].fillna(0) < 0.10)
+        grow = (b_tan['営業益_前年比'] >= 0.30) & (b_tan['営業益_前年'] >= 0.5e8) & (b_tan['予想営業益_前年比'].fillna(0) >= 0.10)
+        ok = (b_tan['営業益'] >= MIN_OP) & (grow | (lead >= 0.20))
+        b_tan = b_tan[ok].copy()
+        b_tan['種類'] = '決算'
+        yoy = b_tan['営業益_前年比'].where(b_tan['営業益_前年'] >= 0.5e8).clip(lower=0, upper=1.5).fillna(0)
+        b_tan['大きさ'] = yoy + b_tan['進捗の上乗せ'].fillna(0).clip(lower=0, upper=0.6) * 2 \
+            + b_tan['予想営業益_前年比'].fillna(0).clip(lower=0, upper=1.0) * 0.5
+    B = pd.concat([b_rev, b_tan]).sort_values('大きさ', ascending=False)
+
+    # --- A・C は本文を読む ---
+    # 自社株買いは「新しく決めた」ものだけ（取得の結果・状況の報告、消却だけの開示、売出しは除く）
+    a = ev[t.str.contains(RERATE) & common & ~t.str.contains(TOB_TARGET)
+           & ~t.str.contains(r'取得結果|取得状況|進捗状況|取得終了|売出し')
+           & ~(t.str.contains('消却') & ~t.str.contains('取得'))].copy()
+    c = ev[t.str.contains(MATERIAL) & common & ~t.str.contains(TOB_TARGET) & ~t.str.contains(TANSHIN)
+           & ~t.str.contains(REVISION) & ~t.str.contains(BUYBACK) & ~t.str.contains(DOWN)
+           & (~t.str.contains(FINANCE) | t.str.contains('提携'))
+           & ~t.str.contains(ROUTINE.pattern.replace('|異動', '').replace('配当|', ''))].copy()
+    need = pd.concat([a, c])['pdf'].drop_duplicates()
+    with ThreadPoolExecutor(workers) as ex:
+        texts = dict(zip(need, ex.map(pdf_text, need)))
+
+    a['本文'] = a['pdf'].map(texts).fillna('')
     a['本気度'] = a['title'].str.contains(RERATE_STRONG)
-    a['点'] = a['対TOPIX'].clip(upper=1.0).rank(pct=True) + a['出来高倍率'].clip(upper=10).rank(pct=True) * 0.5 \
-        + a['本気度'] * 0.6
-    res['A'] = a.sort_values('点', ascending=False).drop_duplicates('code')
+    a['取得割合'] = a['本文'].map(lambda x: max([float(v) for v in SHARE_RATIO.findall(x) if float(v) < 50] or [None])
+                                 if '自己株式' in x else None)
+    a['金額'] = a['本文'].map(lambda x: amounts(x)[0])
+    a['対時価'] = a['金額'] / a['mcap']
+    a['大きさ'] = a['本気度'] * 1.0 + a['取得割合'].fillna(0).clip(upper=15) / 5
+    # 自社株買いだけで小さいもの（2%未満）は落とす
+    a = a[a['本気度'] | (a['取得割合'].fillna(0) >= 2)].sort_values('大きさ', ascending=False)
 
-    # C. 大きな思惑（PER は問わない）
-    base = ev[~t.str.contains(TOB_TARGET) & ~t.str.contains(SKIP_TITLE) & ~t.str.contains(TANSHIN)
-              & ~t.str.contains(BUYBACK)]
-    theme = base[base['title'].str.contains(THEME)]
-    theme = theme[((theme['最大上昇'] >= 0.20) | (theme['初日'] >= 0.10)) & (theme['出来高倍率'] >= 3)]
-    # 表題にキーワードは無いが、出来高を伴って急騰した（材料は開示を読んで確かめる）
-    other = base[~base['title'].str.contains(THEME) & ~base['title'].str.contains(ROUTINE)]
-    other = other[(other['最大上昇'] >= 0.30) & (other['出来高倍率'] >= 5)]
-    c = pd.concat([theme.assign(材料='テーマ'), other.assign(材料='急騰')])
-    c['点'] = c['最大上昇'].clip(upper=3).rank(pct=True) + c['出来高倍率'].clip(upper=30).rank(pct=True) \
-        + c['対TOPIX'].rank(pct=True) * 0.5
-    res['C'] = c.sort_values('点', ascending=False).drop_duplicates('code')
-    return res
+    c['本文'] = c['pdf'].map(texts).fillna('')
+    am = c['本文'].map(amounts)
+    c['金額'] = am.map(lambda x: x[0])
+    c['金額の行'] = am.map(lambda x: x[1])
+    c['年間売上'] = c['code'].map(sales)
+    c['対売上'] = c['金額'] / c['年間売上']
+    c['対時価'] = c['金額'] / c['mcap']
+    c['大きさ'] = c['対売上'].clip(upper=3).fillna(c['対時価'].clip(upper=3) * 0.5).fillna(0)
+    C = c.sort_values('大きさ', ascending=False)
+    return {'A': a, 'B': B, 'C': C}
 
 
 # ---------------- 出力 ----------------
-def _p(x, d=1):
-    return '-' if pd.isna(x) else f'{x * 100:+.{d}f}%'
+def _p(x, d=0):
+    return '-' if x is None or pd.isna(x) else f'{x * 100:+.{d}f}%'
 
 
-def _f(x, fmt='{:.1f}'):
-    return '-' if x is None or pd.isna(x) else fmt.format(x)
+def _oku(x):
+    return '-' if x is None or pd.isna(x) else f'{x / 1e8:,.1f}億'
 
 
-def _row(r, extra: str) -> str:
-    title = r['title'] if len(r['title']) <= 48 else r['title'][:47] + '…'
-    return (f"| {r['code']} | {r['社名']} | {r['市場']} | {_f(r['mcap'] / 1e8 if r['mcap'] else None, '{:,.0f}')} | "
-            f"{_f(r['per'])} | {r['date'][5:]} | [{title}]({r['pdf']}) | {extra} | {_p(r['騰落'])} | {_p(r['対TOPIX'])} |")
+def _ratio(x):
+    return '-' if x is None or pd.isna(x) else f'{x * 100:.0f}%'
+
+
+def _link(r):
+    title = r['title'] if len(r['title']) <= 44 else r['title'][:43] + '…'
+    return f"[{title}]({r['pdf']})"
 
 
 def write(res: dict, out: Path, days: int, top: int, cap: tuple) -> None:
-    L = [f'# 株価目線の候補（{date.today():%Y/%m/%d}、直近{days}日の開示）', '',
-         f'対象: 内国株、時価総額 {cap[0]:,.0f}億〜{cap[1]:,.0f}億円。', '',
-         'TDnet の全銘柄の開示と株価の反応から、機械的に拾った**入口のリスト**。ここから気になる銘柄を選んで `コード_基礎.md` を作る。',
-         '騰落・対TOPIX は「開示の直前の終値」から最新の終値まで。対TOPIX は TOPIX 連動 ETF（1306）との差。', '']
-    head = '| コード | 社名 | 市場 | 時価総額(億) | PER | 開示日 | 開示 | {} | 騰落 | 対TOPIX |\n|---|---|---|--:|--:|---|---|---|--:|--:|'
-    sec = [
-        ('A', 'A. 企業再評価の路線', '中計・資本コスト・還元方針・事業の組み替えなどの開示のあと、株価が TOPIX より5%以上強く、200日線の上にある。◎ は中計・資本コスト・配当方針など本気度の高い開示（自社株買い・分割・優待より上位に置く）。',
-         '出来高倍率', lambda r: _f(r['出来高倍率'], '{:.1f}倍') + (' ◎' if r['本気度'] else '')),
-        ('B', 'B. 好決算なのに地合いで売られた', '決算短信で営業利益（累計）が前年より20%以上増え、通期予想も増益（または上方修正・増配）なのに、発表後に TOPIX より5%以上弱い。',
-         '営業益 前年比 / 通期予想', lambda r: f"{_p(r['op_yoy'], 0)} / {_p(r['op_fc_yoy'], 0)}{' ★修正' if r['上方修正等'] else ''}"),
-        ('C', 'C. 大きな思惑（PER は問わない）', 'AI・半導体・宇宙・防衛・提携・受注・他社の買収などの開示のあと（TOB される側・自社株買いは除く）、最大20%以上（または初日10%以上）上がり、出来高が普段の3倍以上。? は表題にキーワードは無いが、出来高5倍以上で30%以上急騰したもの（材料は開示を読んで確かめる）。',
-         '最大上昇 / 出来高', lambda r: f"{_p(r['最大上昇'], 0)} / {_f(r['出来高倍率'], '{:.0f}倍')}" + (' ?' if r['材料'] == '急騰' else '')),
-    ]
-    for k, h, note, col, fn in sec:
-        df = res[k]
-        L += [f'## {h}（{len(df)}銘柄）', '', note, '', head.format(col)]
-        L += [_row(r, fn(r)) for _, r in df.head(top).iterrows()]
-        L.append('')
-    L += ['> 決算の数字は決算短信の XBRL サマリー（累計・前年同期比）。株価・時価総額・PER は Yahoo Finance。',
-          '> 機械的な抽出なので、開示の中身と株価が動いた本当の理由は必ず読んで確かめる。投資判断は自分で。', '']
+    L = [f'# 材料から見た候補（{date.today():%Y/%m/%d}、直近{days}日の開示）', '',
+         f'TDnet の全銘柄の開示を読み、**材料そのものの大きさ**で並べた機械的な一覧（株価の動きは見ていない）。'
+         f'対象は内国株・時価総額 {cap[0]:,.0f}億〜{cap[1]:,.0f}億円。TOB される側は除く。',
+         '上位の本文を読んだ評価は同じ日付の `_分析.md`。', '']
+
+    A = res['A'].drop_duplicates('code').head(top)
+    L += [f'## A. 企業再評価（{len(res["A"].drop_duplicates("code"))}社）', '',
+          '中計・資本コスト・配当方針・事業の組み替えなど（◎）と、発行済株式の2%以上の自社株買い。', '',
+          '| コード | 社名 | 時価総額 | 開示日 | 開示 | 自社株買い（株数の割合 / 金額） |', '|---|---|--:|---|---|---|']
+    for _, r in A.iterrows():
+        bb = f"{r['取得割合']:.1f}% / {_oku(r['金額'])}" if pd.notna(r['取得割合']) else '-'
+        L.append(f"| {r['code']} | {r['社名']} | {_oku(r['mcap'])} | {r['date'][5:]} | {'◎ ' if r['本気度'] else ''}{_link(r)} | {bb} |")
+
+    B = res['B'].drop_duplicates('code').head(top)
+    L += ['', f'## B. 決算・業績が非常に良い（{len(res["B"].drop_duplicates("code"))}社）', '',
+          '業績予想の上方修正（営業利益 +10% 以上）と、決算短信で営業利益 +30% 以上かつ通期予想も +10% 以上、または通期予想への進捗が標準より20ポイント以上先行（会社予想が減益のままなら「予想が保守的」＝上方修正の余地）。営業利益2億円未満は除く。', '',
+          '| コード | 社名 | 時価総額 | 開示日 | 開示 | 中身 |', '|---|---|--:|---|---|---|']
+    for _, r in B.iterrows():
+        if r['種類'] == '上方修正':
+            what = (f"営業益 {_oku(r['営業益_前回'])}→{_oku(r['営業益_今回'])}（{_p(r['営業益_修正率'])}）"
+                    f"、前期 {_oku(r.get('営業益_前期'))}")
+        else:
+            what = (f"{r['期']} 営業益 {_oku(r['営業益'])}（前年比 {_p(r['営業益_前年比'])}）"
+                    f"、通期予想 {_oku(r['予想営業益'])}（{_p(r['予想営業益_前年比'])}）"
+                    + (f"、進捗 {r['進捗'] * 100:.0f}%（標準 {r['標準進捗'] * 100:.0f}%）" if pd.notna(r.get('進捗')) else '')
+                    + ('、**予想が保守的**' if r.get('予想が保守的') is True else ''))
+        L.append(f"| {r['code']} | {r['社名']} | {_oku(r['mcap'])} | {r['date'][5:]} | {_link(r)} | {what} |")
+
+    C = res['C'].drop_duplicates('code').head(top)
+    L += ['', f'## C. 大きな材料（{len(res["C"].drop_duplicates("code"))}社）', '',
+          '受注・契約・提携・買収・承認など。本文の金額（受注金額・取得価額など）÷ 年間売上（期間内の決算・修正の通期予想）で大きさを見る。金額の無い材料は下に来るので、表題で拾い読みする。', '',
+          '| コード | 社名 | 時価総額 | 開示日 | 開示 | 金額 | 対売上 | 対時価 |', '|---|---|--:|---|---|--:|--:|--:|']
+    for _, r in C.iterrows():
+        L.append(f"| {r['code']} | {r['社名']} | {_oku(r['mcap'])} | {r['date'][5:]} | {_link(r)} | {_oku(r['金額'])} | "
+                 f"{_ratio(r['対売上'])} | {_ratio(r['対時価'])} |")
+    L += ['', '> 数字は TDnet の XBRL と開示 PDF から機械的に取ったもの。金額の取り違えがあり得るので、必ず本文で確かめる。', '']
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text('\n'.join(L), encoding='utf-8')
 
@@ -337,39 +452,24 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--days', type=int, default=21)
     ap.add_argument('--min-mcap', type=float, default=20, help='時価総額の下限（億円）')
-    ap.add_argument('--max-mcap', type=float, default=3000, help='時価総額の上限（億円）。大型株も見るなら大きく')
-    ap.add_argument('--top', type=int, default=25)
+    ap.add_argument('--max-mcap', type=float, default=3000, help='時価総額の上限（億円）')
+    ap.add_argument('--top', type=int, default=30)
     a = ap.parse_args()
 
-    print('1/5 TDnet の開示一覧')
-    ev = tdnet(a.days)
-    lst = jpx_list()
-    ev = ev.merge(lst, on='code', how='inner')
-    print(f'    {len(ev)} 件（内国株）')
-
-    print('2/5 決算短信の XBRL')
-    tan = ev[ev['title'].str.contains(TANSHIN) & ~ev['title'].str.contains(SKIP_TITLE) & (ev['xbrl'] != '')]
-    with ThreadPoolExecutor(6) as ex:
-        sm = dict(zip(tan.index, ex.map(xbrl_summary, tan['xbrl'])))
-    ev = ev.join(pd.DataFrame.from_dict(sm, orient='index'))
-    for c in ('op', 'op_yoy', 'op_fc_yoy', 'sales_yoy'):
-        if c not in ev:
-            ev[c] = None
-    # XBRL の前年比は % 表記（scale=-2 で小数になっている）
-    print(f'    {len(tan)} 件')
-
-    print('3/5 株価')
-    close, vol = prices(sorted(ev['code'].unique()))
-
-    print('4/5 時価総額・PER')
+    print('1/3 TDnet の開示一覧')
+    ev = tdnet(a.days).merge(jpx_list(), on='code', how='inner')
     ev = ev.join(mcaps(), on='code')
+    tob = set(ev.loc[ev['title'].str.contains(TOB_TARGET), 'code'])
+    ev = ev[ev['mcap'].fillna(0).between(a.min_mcap * 1e8, a.max_mcap * 1e8) & ~ev['code'].isin(tob)]
+    print(f'    {len(ev)} 件（内国株・時価総額で絞り、TOB される側を除く）')
 
-    print('5/5 判定')
-    ev = reaction(ev, close, vol)
-    res = pick(ev, a.min_mcap * 1e8, a.max_mcap * 1e8)
+    print('2/3 XBRL と本文を読む')
+    res = evaluate(ev)
+
+    print('3/3 書き出し')
     out = ROOT / 'candidates' / f'{date.today():%Y-%m-%d}.md'
     write(res, out, a.days, a.top, (a.min_mcap, a.max_mcap))
-    print(f"    A {len(res['A'])} / B {len(res['B'])} / C {len(res['C'])} → {out.relative_to(ROOT)}")
+    print(f"    A {res['A']['code'].nunique()} / B {res['B']['code'].nunique()} / C {res['C']['code'].nunique()} → {out.relative_to(ROOT)}")
 
 
 if __name__ == '__main__':
