@@ -1,5 +1,5 @@
 """材料の中身から候補を探す。TDnet の全銘柄の開示を読み、材料そのものの大きさで3つのタイプを拾う（株価の動きは見ない）。
-A（次の決算に向けた候補・勝率ランキング）と C（割安で放置）は、この一覧と決算短信をもとに _分析.md で人が作る。
+A（次の決算に向けた候補・勝率ランキング）と C（割安で放置）は、この一覧と決算短信をもとに _次の決算.md で人が作る。
 
   D. 企業再評価      中計・資本コスト・還元方針・事業の組み替え・自社株買い。自社株買いは取得株数の割合で大きさを見る
   E. 大きな材料      受注・契約・提携・買収・承認など。本文の金額 ÷ 年間売上で大きさを見る
@@ -8,7 +8,7 @@ A（次の決算に向けた候補・勝率ランキング）と C（割安で�
 使い方（リポジトリの一番上で）:
   python tools/candidates.py            # 直近 21 日の開示 → candidates/YYYY-MM-DD.md（機械的な一覧）
   python tools/candidates.py --days 31  # TDnet に残っているのは約1か月分
-  一覧の上位は本文を読み、candidates/YYYY-MM-DD_分析.md に人の頭で評価を書く
+  一覧の上位は本文を読み、candidates/YYYY-MM-DD_次の決算.md（A・B・C）と _材料.md（直近・D・E）に人の頭で評価を書く
 
 データ: TDnet 適時開示一覧と PDF・XBRL（www.release.tdnet.info）、JPX 上場銘柄一覧、Yahoo Finance（時価総額だけ）
 キャッシュ: cache/（git に入れない）
@@ -450,7 +450,7 @@ def write(res: dict, out: Path, days: int, top: int, cap: tuple, recent_days: in
     L = [f'# 材料から見た候補（{date.today():%Y/%m/%d}、直近{days}日の開示）', '',
          f'TDnet の全銘柄の開示を読み、**材料そのものの大きさ**で並べた機械的な一覧（株価の動きは見ていない）。'
          f'対象は内国株・時価総額 {cap[0]:,.0f}億〜{cap[1]:,.0f}億円。TOB される側は除く。',
-         '上位の本文を読んだ評価は同じ日付の `_分析.md`。', '']
+         '上位の本文を読んだ評価は同じ日付の `_次の決算.md` と `_材料.md`。', '']
     # 直近3営業日の開示を先頭にまとめる（鮮度の高いものから見る）
     global RECENT
     days = sorted({d for k in ('A', 'B', 'C') for d in res[k]['date']}, reverse=True)[:recent_days]
