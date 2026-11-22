@@ -1,8 +1,9 @@
 """材料の中身から候補を探す。TDnet の全銘柄の開示を読み、材料そのものの大きさで3つのタイプを拾う（株価の動きは見ない）。
+A（次の決算に向けた候補・勝率ランキング）は、この一覧と決算短信をもとに _分析.md で人が作る。
 
-  A. 企業再評価      中計・資本コスト・還元方針・事業の組み替え・自社株買い。自社株買いは取得株数の割合で大きさを見る
-  B. 大きな材料      受注・契約・提携・買収・承認など。本文の金額 ÷ 年間売上で大きさを見る
-  C. 決算・業績が非常に良い  業績予想の上方修正（XBRL の前回予想→今回予想）と、決算短信の増益率・通期予想への進捗
+  B. 企業再評価      中計・資本コスト・還元方針・事業の組み替え・自社株買い。自社株買いは取得株数の割合で大きさを見る
+  C. 大きな材料      受注・契約・提携・買収・承認など。本文の金額 ÷ 年間売上で大きさを見る
+  D. 決算・業績が非常に良い  業績予想の上方修正（XBRL の前回予想→今回予想）と、決算短信の増益率・通期予想への進捗
 
 使い方（リポジトリの一番上で）:
   python tools/candidates.py            # 直近 21 日の開示 → candidates/YYYY-MM-DD.md（機械的な一覧）
@@ -456,16 +457,16 @@ def write(res: dict, out: Path, days: int, top: int, cap: tuple, recent_days: in
     RECENT = set(days)
     if days:
         L += [f'## 直近{len(days)}営業日（{days[-1][5:].replace("-", "/")}〜{days[0][5:].replace("-", "/")}）の開示', '',
-              '下の A・B・C から、直近の開示だけを抜き出した（各表では【新】）。大引け 15:30 以降の開示は、翌営業日から株価が反応する。', '',
+              '下の B・C・D から、直近の開示だけを抜き出した（各表では【新】）。大引け 15:30 以降の開示は、翌営業日から株価が反応する。', '',
               '| 日付 | 時刻 | タイプ | コード | 社名 | 時価総額 | 開示 |', '|---|---|---|---|---|--:|---|']
-        for k, name in (('A', 'A 企業再評価'), ('C', 'B 大きな材料'), ('B', 'C 決算・業績')):
+        for k, name in (('A', 'B 企業再評価'), ('C', 'C 大きな材料'), ('B', 'D 決算・業績')):
             df = res[k][res[k]['date'].isin(RECENT)].drop_duplicates('code')
             for _, r in df.sort_values(['date', '大きさ'], ascending=[False, False]).iterrows():
                 L.append(f"| {r['date'][5:].replace('-', '/')} | {r['time']} | {name} | {r['code']} | {r['社名']} | {_oku(r['mcap'])} | {_link(r)} |")
         L.append('')
 
     A = res['A'].drop_duplicates('code').head(top)
-    L += [f'## A. 企業再評価（{len(res["A"].drop_duplicates("code"))}社）', '',
+    L += [f'## B. 企業再評価（{len(res["A"].drop_duplicates("code"))}社）', '',
           '中計・資本コスト・配当方針・事業の組み替えなど（◎）と、発行済株式の2%以上の自社株買い。', '',
           '| コード | 社名 | 時価総額 | 開示日 | 開示 | 自社株買い（株数の割合 / 金額） |', '|---|---|--:|---|---|---|']
     for _, r in A.iterrows():
@@ -473,14 +474,14 @@ def write(res: dict, out: Path, days: int, top: int, cap: tuple, recent_days: in
         L.append(f"| {r['code']} | {r['社名']} | {_oku(r['mcap'])} | {r['date'][5:]} | {'◎ ' if r['本気度'] else ''}{_link(r)} | {bb} |")
 
     C = res['C'].drop_duplicates('code').head(top)
-    L += ['', f'## B. 大きな材料（{len(res["C"].drop_duplicates("code"))}社）', '',
+    L += ['', f'## C. 大きな材料（{len(res["C"].drop_duplicates("code"))}社）', '',
           '受注・契約・提携・買収・承認など。本文の金額（受注金額・取得価額など）÷ 年間売上（期間内の決算・修正の通期予想）で大きさを見る。金額の無い材料は下に来るので、表題で拾い読みする。', '',
           '| コード | 社名 | 時価総額 | 開示日 | 開示 | 金額 | 対売上 | 対時価 |', '|---|---|--:|---|---|--:|--:|--:|']
     for _, r in C.iterrows():
         L.append(f"| {r['code']} | {r['社名']} | {_oku(r['mcap'])} | {r['date'][5:]} | {_link(r)} | {_oku(r['金額'])} | "
                  f"{_ratio(r['対売上'])} | {_ratio(r['対時価'])} |")
     B = res['B'].drop_duplicates('code').head(top)
-    L += ['', f'## C. 決算・業績が非常に良い（{len(res["B"].drop_duplicates("code"))}社）', '',
+    L += ['', f'## D. 決算・業績が非常に良い（{len(res["B"].drop_duplicates("code"))}社）', '',
           '業績予想の上方修正（営業利益 +10% 以上。決算短信の中での上方修正で通期予想 +20% 以上も含む）と、決算短信で営業利益 +30% 以上かつ通期予想も +10% 以上、または通期予想への進捗が標準より20ポイント以上先行（会社予想が減益のままなら「予想が保守的」＝上方修正の余地）。営業利益2億円未満は除く。', '',
           '| コード | 社名 | 時価総額 | 開示日 | 開示 | 中身 |', '|---|---|--:|---|---|---|']
     for _, r in B.iterrows():
@@ -522,7 +523,7 @@ def main() -> None:
     print('3/3 書き出し')
     out = ROOT / 'candidates' / f'{date.today():%Y-%m-%d}.md'
     write(res, out, a.days, a.top, (a.min_mcap, a.max_mcap), a.recent)
-    print(f"    A {res['A']['code'].nunique()} / B（材料） {res['C']['code'].nunique()} / C（決算） {res['B']['code'].nunique()} → {out.relative_to(ROOT)}")
+    print(f"    B（再評価） {res['A']['code'].nunique()} / C（材料） {res['C']['code'].nunique()} / D（決算） {res['B']['code'].nunique()} → {out.relative_to(ROOT)}")
 
 
 if __name__ == '__main__':
