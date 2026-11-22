@@ -11,6 +11,7 @@
   stars.txt     流れを変えた重要な開示（★を付ける guid）
   head.md       ファイル前半の「開示から見えたこと」（年表・業績・資金調達・関係者）
   source.json   開示一覧の取り方。type: eirparts（feed）／irpocket（code）／html（pages: [{url, category, pdf_only}]）
+                ／paged（first: 1ページ目の URL、url: 2ページ目以降の URL（{n} がページ番号）、max: 最大ページ数）
   topics.json   テーマ別ファイルの設定（表題か分析に pattern が当たる開示＋include を集め、exclude を除く）
 """
 
@@ -139,7 +140,71 @@ def fetch_feed(code: str) -> list[dict]:
                 out.append({'guid': gid, 'date': f'{y}/{int(mo):02d}/{int(da):02d} 00:00:00', 'title': title, 'link': link,
                             'news_type': _kind_from(cat, title), 'type': 'pdf' if link.lower().endswith('.pdf') else 'url'})
         return out
+    if typ == 'paged':  # ページ送りの一覧（<time> の日付と、その近くのリンク）。例: ユニチカ・テラプローブ
+        out, seen = [], set()
+        for n in range(1, int(src.get('max', 80)) + 1):
+            url = src['first'] if n == 1 else src['url'].format(n=n)
+            try:
+                h = _get(url).decode('utf-8', 'ignore')
+            except Exception:  # noqa: BLE001
+                break
+            got = 0
+            for m in re.finditer(r'<time([^>]*)>(.*?)</time>', h, re.S):
+                txt = _plain(m.group(2))
+                dm = re.search(r'(\d{4})年\s*(\d{1,2})月\s*(\d{1,2})日', txt) or \
+                    re.search(r'datetime="(\d{4})-\s*(\d{1,2})-\s*(\d{1,2})', m.group(1))
+                if not dm:
+                    continue
+                y, mo, da = dm.groups()
+                a_open = h.rfind('<a ', 0, m.start())
+                a_close = h.find('</a>', a_open) if a_open >= 0 else -1
+                if a_open >= 0 and a_close > m.end() and h.find('</article>', a_open, m.start()) < 0 and h.find('</li>', a_open, m.start()) < 0:
+                    a = re.match(r'<a[^>]+href="([^"]+)"[^>]*>(.*?)</a>', h[a_open:a_close + 4], re.S)
+                else:
+                    a = re.compile(r'<a[^>]+href="([^"]+)"[^>]*>(.*?)</a>', re.S).search(h, m.end())
+                if not a:
+                    continue
+                link = urllib.parse.urljoin(url, a.group(1))
+                body = re.sub(r'<time.*?</time>', ' ', a.group(2), flags=re.S)
+                body = re.sub(r'<p class="icon[^"]*">.*?</p>', ' ', body, flags=re.S)
+                title = _plain(body)
+                if not title or link in seen:
+                    continue
+                seen.add(link)
+                got += 1
+                gid = 'p_' + hashlib.md5(link.encode()).hexdigest()[:12]
+                out.append({'guid': gid, 'date': f'{y}/{int(mo):02d}/{int(da):02d} 00:00:00', 'title': title, 'link': link,
+                            'news_type': _kind_from(src.get('category', ''), title),
+                            'type': 'pdf' if link.lower().split('?')[0].endswith('.pdf') else 'url'})
+            if not got:
+                break
+        return out
     raise SystemExit(f'不明な source.type: {typ}')
+
+
+def _plain(x: str) -> str:
+    x = re.sub(r'<[^>]+>', ' ', x)
+    return re.sub(r'\s+', ' ', unicodedata.normalize('NFKC', x)).strip()
+
+
+def _resolve_pdf(link: str, depth: int = 0) -> str | None:
+    """開示の詳細ページ（HTML）から PDF をたどる。PDF への中継ページ（meta refresh）も1段たどる（ユニチカなど）"""
+    try:
+        h = _get(link).decode('utf-8', 'ignore')
+    except Exception:  # noqa: BLE001
+        return None
+    m = re.search(r'http-equiv="refresh"[^>]*URL=([^"\'>]+)', h, re.I)
+    if m and m.group(1).lower().endswith('.pdf'):
+        return urllib.parse.urljoin(link, m.group(1))
+    m = re.search(r'href="([^"]+\.pdf)"', h, re.I)
+    if m:
+        return urllib.parse.urljoin(link, m.group(1))
+    if depth == 0:
+        for cand in re.findall(r'href="([^"]*pdf[^"]*\.html?)"', h, re.I):
+            r = _resolve_pdf(urllib.parse.urljoin(link, cand), 1)
+            if r:
+                return r
+    return None
 
 
 def cmd_fetch(code: str) -> None:
@@ -162,19 +227,22 @@ def cmd_text(code: str, guid: str, pages: int = 6) -> None:
     x = next((x for x in load_items(code) if x['guid'] == guid), None)
     if not x:
         sys.exit(f'{guid} が items.json にありません')
-    if x.get('type') != 'pdf' or not x['link'].endswith('.pdf'):
-        print(f"PDF ではありません: {x['link']}")
-        return
+    pdf_url = x['link']
+    if x.get('type') != 'pdf' or not pdf_url.lower().split('?')[0].endswith('.pdf'):
+        pdf_url = _resolve_pdf(x['link'])  # 詳細ページから PDF をたどる（ユニチカなど）
+        if not pdf_url:
+            print(f"PDF ではありません: {x['link']}")
+            return
     with tempfile.TemporaryDirectory() as td:
         pdf = Path(td) / 'a.pdf'
-        with urllib.request.urlopen(urllib.request.Request(x['link'], headers=UA), timeout=120) as r:
+        with urllib.request.urlopen(urllib.request.Request(pdf_url, headers=UA), timeout=120) as r:
             pdf.write_bytes(r.read())
         txt = subprocess.run(['pdftotext', '-l', str(pages), '-layout', str(pdf), '-'],
                              capture_output=True, text=True).stdout
     txt = unicodedata.normalize('NFKC', txt)
     txt = re.sub(r'[ \t]+', ' ', txt)
     txt = re.sub(r'\n\s*\n+', '\n', txt)
-    print(f"# {x['date']} {x['title']}\n# {x['link']}\n")
+    print(f"# {x['date']} {x['title']}\n# {pdf_url}\n")
     print(txt[:8000])
 
 
