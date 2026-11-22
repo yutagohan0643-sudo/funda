@@ -43,7 +43,7 @@
 TDnet の全銘柄の開示を読み、**材料そのものの大きさ**で候補を拾う入口（株価の動きは見ない）。上位は本文を読んで評価し、深掘りする銘柄は上の手順で `コード_基礎.md` を作る。
 
 ```bash
-python tools/candidates.py               # 直近21日の開示 → candidates/YYYY-MM-DD.md（機械的な一覧）
+python tools/candidates.py               # 直近21日の開示 → candidates/YYYY-MM-DD.md（先頭に直近3営業日の開示、各表は【新】）
 python tools/candidates.py --days 31 --max-mcap 10000
 ```
 

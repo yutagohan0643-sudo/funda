@@ -436,16 +436,33 @@ def _ratio(x):
     return '-' if x is None or pd.isna(x) else f'{x * 100:.0f}%'
 
 
+RECENT: set = set()  # 直近の営業日（write で決める）
+
+
 def _link(r):
     title = r['title'] if len(r['title']) <= 44 else r['title'][:43] + '…'
-    return f"[{title}]({r['pdf']})"
+    new = '【新】' if r['date'] in RECENT else ''
+    return f"{new}[{title}]({r['pdf']})"
 
 
-def write(res: dict, out: Path, days: int, top: int, cap: tuple) -> None:
+def write(res: dict, out: Path, days: int, top: int, cap: tuple, recent_days: int = 3) -> None:
     L = [f'# 材料から見た候補（{date.today():%Y/%m/%d}、直近{days}日の開示）', '',
          f'TDnet の全銘柄の開示を読み、**材料そのものの大きさ**で並べた機械的な一覧（株価の動きは見ていない）。'
          f'対象は内国株・時価総額 {cap[0]:,.0f}億〜{cap[1]:,.0f}億円。TOB される側は除く。',
          '上位の本文を読んだ評価は同じ日付の `_分析.md`。', '']
+    # 直近3営業日の開示を先頭にまとめる（鮮度の高いものから見る）
+    global RECENT
+    days = sorted({d for k in ('A', 'B', 'C') for d in res[k]['date']}, reverse=True)[:recent_days]
+    RECENT = set(days)
+    if days:
+        L += [f'## 直近{len(days)}営業日（{days[-1][5:].replace("-", "/")}〜{days[0][5:].replace("-", "/")}）の開示', '',
+              '下の A・B・C から、直近の開示だけを抜き出した（各表では【新】）。大引け 15:30 以降の開示は、翌営業日から株価が反応する。', '',
+              '| 日付 | 時刻 | タイプ | コード | 社名 | 時価総額 | 開示 |', '|---|---|---|---|---|--:|---|']
+        for k, name in (('A', 'A 企業再評価'), ('C', 'B 大きな材料'), ('B', 'C 決算・業績')):
+            df = res[k][res[k]['date'].isin(RECENT)].drop_duplicates('code')
+            for _, r in df.sort_values(['date', '大きさ'], ascending=[False, False]).iterrows():
+                L.append(f"| {r['date'][5:].replace('-', '/')} | {r['time']} | {name} | {r['code']} | {r['社名']} | {_oku(r['mcap'])} | {_link(r)} |")
+        L.append('')
 
     A = res['A'].drop_duplicates('code').head(top)
     L += [f'## A. 企業再評価（{len(res["A"].drop_duplicates("code"))}社）', '',
@@ -489,6 +506,7 @@ def main() -> None:
     ap.add_argument('--min-mcap', type=float, default=20, help='時価総額の下限（億円）')
     ap.add_argument('--max-mcap', type=float, default=3000, help='時価総額の上限（億円）')
     ap.add_argument('--top', type=int, default=30)
+    ap.add_argument('--recent', type=int, default=3, help='先頭にまとめる直近の営業日数')
     a = ap.parse_args()
 
     print('1/3 TDnet の開示一覧')
@@ -503,7 +521,7 @@ def main() -> None:
 
     print('3/3 書き出し')
     out = ROOT / 'candidates' / f'{date.today():%Y-%m-%d}.md'
-    write(res, out, a.days, a.top, (a.min_mcap, a.max_mcap))
+    write(res, out, a.days, a.top, (a.min_mcap, a.max_mcap), a.recent)
     print(f"    A {res['A']['code'].nunique()} / B（材料） {res['C']['code'].nunique()} / C（決算） {res['B']['code'].nunique()} → {out.relative_to(ROOT)}")
 
 
