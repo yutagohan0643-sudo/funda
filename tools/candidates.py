@@ -222,6 +222,27 @@ def revision_metrics(f: dict) -> dict:
     return out
 
 
+def qual_text(url: str, n: int = 15000) -> str:
+    """決算短信 XBRL の定性的情報（経営成績の説明など）を文字にして返す"""
+    key = re.sub(r'\W', '', url.rsplit('/', 1)[-1])
+    p = CACHE / 'qual' / f'{key}.txt'
+    if p.exists():
+        return p.read_text()
+    txt = ''
+    try:
+        z = zipfile.ZipFile(io.BytesIO(_get(url)))
+        name = next((x for x in z.namelist() if x.endswith('qualitative.htm')), None)
+        if name:
+            h = z.read(name).decode('utf-8', 'ignore')
+            h = re.sub(r'<(script|style)[^>]*>.*?</\1>', ' ', h, flags=re.S)
+            txt = re.sub(r'\s+', ' ', unicodedata.normalize('NFKC', re.sub(r'<[^>]+>', ' ', h)))[:n]
+    except Exception:  # noqa: BLE001
+        txt = ''
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(txt)
+    return txt
+
+
 # ---------------- PDF 本文 ----------------
 def pdf_text(url: str, pages: int = 3) -> str:
     key = re.sub(r'\W', '', url.rsplit('/', 1)[-1])
