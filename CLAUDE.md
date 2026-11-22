@@ -24,12 +24,6 @@
 6. `main` にコミットして push。コミットメッセージは「開示を追加: 銘柄名 N件（主なもの）」のように日本語で
 7. 新しい開示がなければ何もコミットしない
 
-## 信用残ウォッチ（自動）
-
-- `margin/`・`data/margin/`・`data/fundamentals/`・`data/market_margin.csv` は GitHub Actions（`.github/workflows/margin.yml`、平日 17:30・19:17）が `python -m margin_tracker` で書く。**手で編集しない**
-- 監視銘柄は `watchlist.txt`（「銘柄コード 銘柄名 [関連する米国のテーマ]」を1行ずつ）
-- コードを直したら `python -m pytest tests/test_margin_tracker.py` を通してから push
-
 ## 書き方
 
 - 文章は日本語。専門用語はなるべくかみ砕く
