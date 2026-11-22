@@ -243,6 +243,14 @@ def qual_text(url: str, n: int = 15000) -> str:
     return txt
 
 
+def forecast_note(q: str) -> str:
+    """定性的情報のうち「業績予想などの将来予測情報に関する説明」の本文（目次は飛ばす）"""
+    for m in re.finditer('将来予測情報', q):
+        if not re.match(r'[^。]{0,40}?(?:\.{4,}|…{2,})', q[m.end():m.end() + 60]):
+            return q[m.start():m.start() + 600]
+    return ''
+
+
 # ---------------- PDF 本文 ----------------
 def pdf_text(url: str, pages: int = 3) -> str:
     key = re.sub(r'\W', '', url.rsplit('/', 1)[-1])
@@ -366,13 +374,18 @@ def evaluate(ev: pd.DataFrame, workers: int = 6) -> dict[str, pd.DataFrame]:
         b_tan['進捗の上乗せ'] = lead
         # 会社予想が前年より大きく減益のまま、進捗だけ高い = 予想が古い・保守的（上方修正の余地）
         b_tan['予想が保守的'] = (lead >= 0.20) & (b_tan['予想営業益_前年比'].fillna(0) < 0.10)
+        # 別の開示を出さず、決算短信の中で上方修正する会社もある（例: サンコール 2026/11/13）
+        with ThreadPoolExecutor(workers) as ex:
+            qs = list(ex.map(qual_text, b_tan['xbrl']))
+        b_tan['短信で上方修正'] = [bool(re.search(r'上方修正', forecast_note(q))) for q in qs]
         grow = (b_tan['営業益_前年比'] >= 0.30) & (b_tan['営業益_前年'] >= 0.5e8) & (b_tan['予想営業益_前年比'].fillna(0) >= 0.10)
-        ok = (b_tan['営業益'] >= MIN_OP) & (grow | (lead >= 0.20))
+        revised = b_tan['短信で上方修正'] & (b_tan['予想営業益_前年比'].fillna(0) >= 0.20)
+        ok = (b_tan['営業益'] >= MIN_OP) & (grow | (lead >= 0.20) | revised)
         b_tan = b_tan[ok].copy()
         b_tan['種類'] = '決算'
         yoy = b_tan['営業益_前年比'].where(b_tan['営業益_前年'] >= 0.5e8).clip(lower=0, upper=1.5).fillna(0)
         b_tan['大きさ'] = yoy + b_tan['進捗の上乗せ'].fillna(0).clip(lower=0, upper=0.6) * 2 \
-            + b_tan['予想営業益_前年比'].fillna(0).clip(lower=0, upper=1.0) * 0.5
+            + b_tan['予想営業益_前年比'].fillna(0).clip(lower=0, upper=1.0) * 0.5 + b_tan['短信で上方修正'] * 0.3
     B = pd.concat([b_rev, b_tan]).sort_values('大きさ', ascending=False)
 
     # --- A・C は本文を読む ---
@@ -444,7 +457,7 @@ def write(res: dict, out: Path, days: int, top: int, cap: tuple) -> None:
 
     B = res['B'].drop_duplicates('code').head(top)
     L += ['', f'## B. 決算・業績が非常に良い（{len(res["B"].drop_duplicates("code"))}社）', '',
-          '業績予想の上方修正（営業利益 +10% 以上）と、決算短信で営業利益 +30% 以上かつ通期予想も +10% 以上、または通期予想への進捗が標準より20ポイント以上先行（会社予想が減益のままなら「予想が保守的」＝上方修正の余地）。営業利益2億円未満は除く。', '',
+          '業績予想の上方修正（営業利益 +10% 以上。決算短信の中での上方修正で通期予想 +20% 以上も含む）と、決算短信で営業利益 +30% 以上かつ通期予想も +10% 以上、または通期予想への進捗が標準より20ポイント以上先行（会社予想が減益のままなら「予想が保守的」＝上方修正の余地）。営業利益2億円未満は除く。', '',
           '| コード | 社名 | 時価総額 | 開示日 | 開示 | 中身 |', '|---|---|--:|---|---|---|']
     for _, r in B.iterrows():
         if r['種類'] == '上方修正':
@@ -454,7 +467,8 @@ def write(res: dict, out: Path, days: int, top: int, cap: tuple) -> None:
             what = (f"{r['期']} 営業益 {_oku(r['営業益'])}（前年比 {_p(r['営業益_前年比'])}）"
                     f"、通期予想 {_oku(r['予想営業益'])}（{_p(r['予想営業益_前年比'])}）"
                     + (f"、進捗 {r['進捗'] * 100:.0f}%（標準 {r['標準進捗'] * 100:.0f}%）" if pd.notna(r.get('進捗')) else '')
-                    + ('、**予想が保守的**' if r.get('予想が保守的') is True else ''))
+                    + ('、**予想が保守的**' if r.get('予想が保守的') is True else '')
+                    + ('、**短信で上方修正**' if r.get('短信で上方修正') is True else ''))
         L.append(f"| {r['code']} | {r['社名']} | {_oku(r['mcap'])} | {r['date'][5:]} | {_link(r)} | {what} |")
 
     C = res['C'].drop_duplicates('code').head(top)
