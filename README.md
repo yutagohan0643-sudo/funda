@@ -2,10 +2,11 @@
 
 決算・開示を読んで、株価が何を織り込んでいるかを考える。
 
-## 最新の候補（2026/11/21、11/23 見直し）
+## 銘柄探し・割安判定
 
-- [次の決算（2027/02）に向けた候補](candidates/2026-11-21_次の決算.md) — 決算の傾向・A 勝率ランキング・B 決算・C 割安で放置
-- [直近の材料](candidates/2026-11-21_材料.md) — 直近3営業日・D 企業再評価・E 大きな材料
+- 新しい銘柄の候補探し（直近の開示から）と、監視銘柄の割安判定は [trade リポジトリ](https://github.com/yutagohan0643-sudo/trade) に移した
+  - [ファンダの未発掘銘柄探し](https://github.com/yutagohan0643-sudo/trade/blob/main/candidates/README.md)
+  - [監視銘柄の割安判定](https://github.com/yutagohan0643-sudo/trade/blob/main/valuation/README.md)
 
 ## 銘柄の分析
 
@@ -32,7 +33,7 @@
 
 - 基礎分析の考え方: [手順.md](手順.md)（10の手順）
 - 開示は平日の夜の定期実行で書き足す: [CLAUDE.md](CLAUDE.md)・`tools/disclosures.py`・`data/コード/`
-- 候補探し: `python tools/candidates.py`（直近21日の TDnet の開示 → `candidates/YYYY-MM-DD.md`）。A〜E の測り方は各候補ファイルの冒頭。新しい候補ファイルを作ったら上の「最新の候補」のリンクを差し替える
+- 候補探しは trade リポジトリ（`python tools/candidates.py`）。ここでは候補から選んだ銘柄を深掘りする
 - 信用残ウォッチは [technical リポジトリ](https://github.com/yutagohan0643-sudo/technical)
 
 数字は開示資料から。PER・シナリオは私の推定で、投資判断は自分で。
