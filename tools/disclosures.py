@@ -10,7 +10,7 @@
   comments.tsv  1件ずつの分析（guid<TAB>分析）。新しい開示はここに1行足す
   stars.txt     流れを変えた重要な開示（★を付ける guid）
   head.md       ファイル前半の「開示から見えたこと」（年表・業績・資金調達・関係者）
-  source.json   開示一覧の取り方。type: eirparts（feed）／irpocket（code）／html（pages: [{url, category, pdf_only}]）
+  source.json   開示一覧の取り方。type: eirparts（feed）／irpocket（code）／jpx（code。東証の上場会社情報サービス）／html（pages: [{url, category, pdf_only}]）
                 ／paged（first: 1ページ目の URL、url: 2ページ目以降の URL（{n} がページ番号）、max: 最大ページ数）
   topics.json   テーマ別ファイルの設定（表題か分析に pattern が当たる開示＋include を集め、exclude を除く）
 """
@@ -178,6 +178,28 @@ def fetch_feed(code: str) -> list[dict]:
                             'type': 'pdf' if link.lower().split('?')[0].endswith('.pdf') else 'url'})
             if not got:
                 break
+        return out
+    if typ == 'jpx':  # 東証の上場会社情報サービス（適時開示の一覧。PDF のみ）
+        import http.cookiejar
+        cj = http.cookiejar.CookieJar()
+        op = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
+        base = 'https://www2.jpx.co.jp/tseHpFront/'
+        def post(url, data):
+            req = urllib.request.Request(url, data=urllib.parse.urlencode(data).encode(), headers=UA)
+            return op.open(req, timeout=60).read().decode('utf-8', 'ignore')
+        op.open(urllib.request.Request(base + 'JJK020010Action.do?Show=Show', headers=UA), timeout=60).read()
+        h = post(base + 'JJK020010Action.do', {'ListShow': 'ListShow', 'sniMtGmnId': '', 'dspSsuPd': '10', 'mgrMiTxtBx': '', 'eqMgrCd': src['code']})
+        act = re.search(r'action="/tseHpFront/(JJK020030Action[^"]*)"', h).group(1)
+        h = post(base + act, {'BaseJh': 'BaseJh', 'mgrCd': src['code'] + '0', 'jjHisiFlg': '1', 'lstDspPg': '1', 'dspGs': '10',
+                              'souKnsu': '1', 'sniMtGmnId': 'JJK020010', 'dspJnKbn': '0', 'dspJnKmkNo': '0'})
+        out, seen = [], set()
+        for m in re.finditer(r'<td[^>]*>\s*(\d{4}/\d{2}/\d{2})\s*</td>(?:(?!<tr).)*?<a href="(/disc/[^"]+\.pdf)"[^>]*>\s*(.*?)\s*</a>', h, re.S):
+            d, link, title = m.group(1), 'https://www2.jpx.co.jp' + m.group(2), re.sub(r'\s+', ' ', re.sub(r'<[^>]+>', '', m.group(3))).strip()
+            if link in seen:
+                continue
+            seen.add(link)
+            gid = 'jpx_' + link.rsplit('/', 1)[-1][:-4]
+            out.append({'guid': gid, 'date': d + ' 00:00:00', 'title': title, 'link': link, 'news_type': _kind_from('', title), 'type': 'pdf'})
         return out
     raise SystemExit(f'不明な source.type: {typ}')
 
