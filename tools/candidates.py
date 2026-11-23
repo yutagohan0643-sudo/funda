@@ -343,6 +343,45 @@ def mcaps() -> pd.Series:
 
 
 # ---------------- 材料の評価 ----------------
+# 決算と一緒に出た株主還元（11月の決算1,648社の検証で、株価の反応にいちばん効いた。candidates/2026-11-23_決算の反応.md）
+RETURN = re.compile(r'増配|配当予想の修正|株主還元|配当方針|自己株式の取得|自己株式取得に係る')
+RETURN_SKIP = re.compile(r'取得結果|取得状況|進捗状況|取得終了|減配')
+# 加点・減点（同じ検証から）
+BONUS_RETURN = 0.4      # 増配・配当予想の修正・還元方針・自社株買いを決算の前後1日に出した
+PEN_RERATED = 0.4       # 1年で +100% 以上（すでに見直された。決算後に売られやすかった）
+PEN_DOWNTREND = 0.2     # 3か月で -15% 以下（下げが続いている。決算後も下げ続けやすかった）
+
+
+def returns_near(ev: pd.DataFrame, code: str, day: str) -> str:
+    """決算の前後1日に出た株主還元の開示（なければ空）"""
+    d = pd.to_datetime(day)
+    x = ev[(ev['code'] == code) & ((pd.to_datetime(ev['date']) - d).abs() <= pd.Timedelta(days=1))]['title']
+    x = x[x.str.contains(RETURN) & ~x.str.contains(RETURN_SKIP)]
+    k = []
+    if x.str.contains('増配|配当予想の修正').any(): k.append('増配')
+    if x.str.contains('株主還元|配当方針').any(): k.append('還元方針')
+    if x.str.contains('自己株式').any(): k.append('自社株買い')
+    return '・'.join(k)
+
+
+def trend(code: str) -> tuple[float | None, float | None]:
+    """1年と3か月の株価の騰落（Yahoo Finance の日足。1日ごとにキャッシュ）"""
+    p = CACHE / 'chart' / f'{date.today():%Y%m%d}_{code}.json'
+    try:
+        if p.exists():
+            c = json.loads(p.read_text())
+        else:
+            d = json.loads(_get(f'https://query1.finance.yahoo.com/v8/finance/chart/{code}.T?range=1y&interval=1d'))
+            c = [x for x in d['chart']['result'][0]['indicators']['quote'][0]['close'] if x]
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(json.dumps(c))
+        if len(c) < 70:
+            return None, None
+        return c[-1] / c[0] - 1, c[-1] / c[-64] - 1
+    except Exception:  # noqa: BLE001
+        return None, None
+
+
 def evaluate(ev: pd.DataFrame, workers: int = 6) -> dict[str, pd.DataFrame]:
     t = ev['title']
     common = ~t.str.contains(SKIP_TITLE)
@@ -387,7 +426,17 @@ def evaluate(ev: pd.DataFrame, workers: int = 6) -> dict[str, pd.DataFrame]:
         yoy = b_tan['営業益_前年比'].where(b_tan['営業益_前年'] >= 0.5e8).clip(lower=0, upper=1.5).fillna(0)
         b_tan['大きさ'] = yoy + b_tan['進捗の上乗せ'].fillna(0).clip(lower=0, upper=0.6) * 2 \
             + b_tan['予想営業益_前年比'].fillna(0).clip(lower=0, upper=1.0) * 0.5 + b_tan['短信で上方修正'] * 0.3
-    B = pd.concat([b_rev, b_tan]).sort_values('大きさ', ascending=False)
+    B = pd.concat([b_rev, b_tan])
+    B['還元'] = [returns_near(ev, c, d) for c, d in zip(B['code'], B['date'])]
+    B['大きさ'] = B['大きさ'] + (B['還元'] != '') * BONUS_RETURN
+    B = B.sort_values('大きさ', ascending=False)
+    head = B.drop_duplicates('code').head(80)['code']
+    with ThreadPoolExecutor(workers) as ex:
+        tr = dict(zip(head, ex.map(trend, head)))
+    B['1年'] = B['code'].map(lambda c: tr.get(c, (None, None))[0])
+    B['3か月'] = B['code'].map(lambda c: tr.get(c, (None, None))[1])
+    B['大きさ'] = B['大きさ'] - (B['1年'].fillna(0) >= 1.0) * PEN_RERATED - (B['3か月'].fillna(0) <= -0.15) * PEN_DOWNTREND
+    B = B.sort_values('大きさ', ascending=False)
 
     # --- A・C は本文を読む ---
     # 自社株買いは「新しく決めた」ものだけ（取得の結果・状況の報告、消却だけの開示、売出しは除く）
@@ -468,7 +517,8 @@ def write(res: dict, out: Path, days: int, top: int, cap: tuple, recent_days: in
     B = res['B'].drop_duplicates('code').head(top)
     L += [f'## B. 決算・業績が非常に良い（{len(res["B"].drop_duplicates("code"))}社）', '',
           '業績予想の上方修正（営業利益 +10% 以上。決算短信の中での上方修正で通期予想 +20% 以上も含む）と、決算短信で営業利益 +30% 以上かつ通期予想も +10% 以上、または通期予想への進捗が標準より20ポイント以上先行（会社予想が減益のままなら「予想が保守的」＝上方修正の余地）。営業利益2億円未満は除く。', '',
-          '| コード | 社名 | 時価総額 | 開示日 | 開示 | 中身 |', '|---|---|--:|---|---|---|']
+          '並び順には、11月の決算の株価の反応の検証（[`2026-11-23_決算の反応.md`](2026-11-23_決算の反応.md)）から、**決算と一緒の増配・自社株買い・還元方針を加点**、**1年で2倍以上（見直し済み）と3か月で -15% 以下（下げが続いている）を減点**した。', '',
+          '| コード | 社名 | 時価総額 | 開示日 | 開示 | 中身 | 還元 | 株価 1年 / 3か月 |', '|---|---|--:|---|---|---|---|---|']
     for _, r in B.iterrows():
         if r['種類'] == '上方修正':
             what = (f"営業益 {_oku(r['営業益_前回'])}→{_oku(r['営業益_今回'])}（{_p(r['営業益_修正率'])}）"
@@ -479,7 +529,10 @@ def write(res: dict, out: Path, days: int, top: int, cap: tuple, recent_days: in
                     + (f"、進捗 {r['進捗'] * 100:.0f}%（標準 {r['標準進捗'] * 100:.0f}%）" if pd.notna(r.get('進捗')) else '')
                     + ('、**予想が保守的**' if r.get('予想が保守的') is True else '')
                     + ('、**短信で上方修正**' if r.get('短信で上方修正') is True else ''))
-        L.append(f"| {r['code']} | {r['社名']} | {_oku(r['mcap'])} | {r['date'][5:]} | {_link(r)} | {what} |")
+        tr = (f"{_p(r['1年'])} / {_p(r['3か月'])}" if pd.notna(r.get('1年')) else '-')
+        if pd.notna(r.get('1年')) and r['1年'] >= 1.0: tr += ' 見直し済み'
+        if pd.notna(r.get('3か月')) and r['3か月'] <= -0.15: tr += ' 下げ続き'
+        L.append(f"| {r['code']} | {r['社名']} | {_oku(r['mcap'])} | {r['date'][5:]} | {_link(r)} | {what} | {r.get('還元') or '-'} | {tr} |")
 
     A = res['A'].drop_duplicates('code').head(top)
     L += ['', f'## D. 企業再評価（{len(res["A"].drop_duplicates("code"))}社）', '',
