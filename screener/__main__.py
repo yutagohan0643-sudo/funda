@@ -17,7 +17,7 @@ import requests
 
 from . import fundamentals, jpx, store
 
-from . import core, names, rank, tdnet
+from . import core, names, promote, rank, tdnet
 from .report import build, build_ranking
 
 SPARK_URL = "https://query1.finance.yahoo.com/v7/finance/spark"
@@ -210,13 +210,11 @@ def main(argv: list[str] | None = None) -> int:
     ranked = rank.rank(results + sub_results, bars, news, indices, uni, now)
     (out_dir / "ranking.md").write_text(build_ranking(ranked, now=now, sigma=args.sigma, days=args.days,
                                                       tdnet_days=tdnet.DAYS), encoding="utf-8")
-    pd.DataFrame([{
-        "rank": i + 1, "code": x.result.touch.code, "name": x.result.touch.name,
-        "low_sigma": round(x.result.touch.low_sigma, 2), "avg_volume": round(x.result.touch.avg_volume),
-        "total": x.total, "fund": x.fund_pts, "hope": x.hope_pts,
-        "rebound": x.rebound_pts, "verdict": x.verdict, "reasons": " / ".join(x.reasons), "good_news": " / ".join(x.good_news),
-    } for i, x in enumerate(ranked)]).to_csv(hist_dir / f"ranking_{data_day:%Y%m%d}.csv", index=False)
-    log(f"ランキング: {out_dir / 'ranking.md'}（{len(ranked)} 銘柄）")
+    rows = [promote.row(x, uni) for x in ranked]
+    pd.DataFrame([{"rank": i + 1, **r} for i, r in enumerate(rows)]).to_csv(
+        hist_dir / f"ranking_{data_day:%Y%m%d}.csv", index=False)
+    (out_dir / "昇格候補.md").write_text(promote.build(promote.pick(rows), now, len(rows)), encoding="utf-8")
+    log(f"ランキング: {out_dir / 'ranking.md'}（{len(ranked)} 銘柄）・昇格候補: {out_dir / '昇格候補.md'}")
     rows = [{
         "level": f"-{args.sigma:g}σ" if r.touch.low_sigma <= -args.sigma else f"-{sub_sigma:g}σ",
         "code": r.touch.code, "name": r.touch.name, "touch_date": r.touch.date.date(), "close": r.touch.close,

@@ -172,3 +172,38 @@ def test_ranking_splits_by_average_volume():
     big, small = md.split("## 平均出来高 50万株未満")[:2]
     assert "1111" in big.split("## 平均出来高 50万株以上")[1] and "2222" not in big
     assert "2222" in small and "1111" not in small
+
+
+def _prow(**kw):
+    base = {"code": "1111", "name": "テスト", "close": 1000.0, "low_sigma": -3.0, "avg_volume": 100000, "total": 70,
+            "fund": 30, "hope": 20, "rebound": 20, "verdict": "不当な下げ", "fund_verdict": "増収増益", "per": 9.0,
+            "pbr": 0.8, "market_cap": 5e10, "buy_ratio": 0.03, "concerns": "", "reasons": "地合い", "good_news": ""}
+    base.update(kw)
+    return base
+
+
+def test_promote_filters_and_sorts():
+    from screener import promote
+
+    rows = [
+        _prow(code="A", total=70),
+        _prow(code="B", total=80),
+        _prow(code="C", verdict="然るべき下げ"),
+        _prow(code="D", total=60),
+        _prow(code="E", fund_verdict="増収減益"),
+        _prow(code="F", per=20.0),
+        _prow(code="G", per=None),
+        _prow(code="H", buy_ratio=0.15),
+        _prow(code="I", buy_ratio=None, fund_verdict="営業黒字に転換"),
+    ]
+    assert [r["code"] for r in promote.pick(rows)] == ["B", "A", "I"]
+
+
+def test_promote_report():
+    import pandas as pd
+    from screener import promote
+
+    md = promote.build([_prow(code="8508", name="Ｊトラスト", total=78)], pd.Timestamp("2026-11-28 07:00"), 826)
+    assert "826 銘柄から" in md and "**1 銘柄**" in md and "| 8508 Ｊトラスト | 1,000 |" in md
+    assert "60点以上なら監視を続け" in md
+    assert "基準を満たす銘柄なし" in promote.build([], pd.Timestamp("2026-11-28"), 10)

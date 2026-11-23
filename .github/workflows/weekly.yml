@@ -1,0 +1,45 @@
+name: 未発掘銘柄探し（週1回）
+
+on:
+  schedule:
+    # 毎週土曜 6:30（日本時間）。金曜までの1週間の値動き・開示で探す
+    - cron: "30 21 * * 5"
+  workflow_dispatch: # GitHub の画面から手動でも実行できる
+
+permissions:
+  contents: write
+
+concurrency:
+  group: weekly-screen
+  cancel-in-progress: false
+
+jobs:
+  screen:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: PDF を読む道具を入れる（候補探しが決算短信を読む）
+        run: sudo apt-get install -y -qq poppler-utils
+      - run: pip install -r requirements.txt
+      - name: 売られすぎスクリーナー（-3σ・-2σ・ランキング・昇格候補）
+        run: python -m screener
+      - name: ファンダの候補探し（直近21日の開示の機械的な一覧）
+        continue-on-error: true # 失敗してもスクリーナーの結果は保存する
+        run: python tools/candidates.py
+      - name: 変更をコミット
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add screener candidates data
+          if git diff --cached --quiet; then
+            echo "変更なし"
+          else
+            git commit -m "未発掘銘柄探しを更新 $(TZ=Asia/Tokyo date '+%Y-%m-%d %H:%M')"
+            git pull --rebase
+            git push
+          fi
