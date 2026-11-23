@@ -347,9 +347,9 @@ def mcaps() -> pd.Series:
 RETURN = re.compile(r'増配|配当予想の修正|株主還元|配当方針|自己株式の取得|自己株式取得に係る')
 RETURN_SKIP = re.compile(r'取得結果|取得状況|進捗状況|取得終了|減配')
 # 加点・減点（同じ検証から）
-BONUS_RETURN = 0.4      # 増配・配当予想の修正・還元方針・自社株買いを決算の前後1日に出した
+BONUS_RETURN = 0.4      # 増配・配当予想の修正・還元方針・自社株買いを決算の前後1日に出した（直近の開示だけ）
 PEN_RERATED = 0.4       # 1年で +100% 以上（すでに見直された。決算後に売られやすかった）
-PEN_DOWNTREND = 0.2     # 3か月で -15% 以下（下げが続いている。決算後も下げ続けやすかった）
+PEN_DOWNTREND = 0.3     # 3か月で -15% 以下（下げが続いている。決算前に分かる要素でいちばん強かった）
 
 
 def returns_near(ev: pd.DataFrame, code: str, day: str) -> str:
@@ -428,7 +428,9 @@ def evaluate(ev: pd.DataFrame, workers: int = 6) -> dict[str, pd.DataFrame]:
             + b_tan['予想営業益_前年比'].fillna(0).clip(lower=0, upper=1.0) * 0.5 + b_tan['短信で上方修正'] * 0.3
     B = pd.concat([b_rev, b_tan])
     B['還元'] = [returns_near(ev, c, d) for c, d in zip(B['code'], B['date'])]
-    B['大きさ'] = B['大きさ'] + (B['還元'] != '') * BONUS_RETURN
+    # 還元の効果は発表の翌営業日でほぼ出尽くす（その後の上乗せはない）ので、加点はまだ反応していない直近の開示だけ
+    fresh = pd.to_datetime(B['date']) >= pd.to_datetime(ev['date']).max() - pd.Timedelta(days=1)
+    B['大きさ'] = B['大きさ'] + ((B['還元'] != '') & fresh) * BONUS_RETURN
     B = B.sort_values('大きさ', ascending=False)
     head = B.drop_duplicates('code').head(80)['code']
     with ThreadPoolExecutor(workers) as ex:
@@ -517,7 +519,7 @@ def write(res: dict, out: Path, days: int, top: int, cap: tuple, recent_days: in
     B = res['B'].drop_duplicates('code').head(top)
     L += [f'## B. 決算・業績が非常に良い（{len(res["B"].drop_duplicates("code"))}社）', '',
           '業績予想の上方修正（営業利益 +10% 以上。決算短信の中での上方修正で通期予想 +20% 以上も含む）と、決算短信で営業利益 +30% 以上かつ通期予想も +10% 以上、または通期予想への進捗が標準より20ポイント以上先行（会社予想が減益のままなら「予想が保守的」＝上方修正の余地）。営業利益2億円未満は除く。', '',
-          '並び順には、11月の決算の株価の反応の検証（[`2026-11-23_決算の反応.md`](2026-11-23_決算の反応.md)）から、**決算と一緒の増配・自社株買い・還元方針を加点**、**1年で2倍以上（見直し済み）と3か月で -15% 以下（下げが続いている）を減点**した。', '',
+          '並び順には、11月の決算の株価の反応の検証（[`2026-11-23_決算の反応.md`](2026-11-23_決算の反応.md)）から、**まだ株価が反応していない直近の決算と一緒の増配・自社株買い・還元方針を加点**（反応は翌営業日でほぼ出尽くす）、**1年で2倍以上（見直し済み）と3か月で -15% 以下（下げが続いている）を減点**した。', '',
           '| コード | 社名 | 時価総額 | 開示日 | 開示 | 中身 | 還元 | 株価 1年 / 3か月 |', '|---|---|--:|---|---|---|---|---|']
     for _, r in B.iterrows():
         if r['種類'] == '上方修正':
