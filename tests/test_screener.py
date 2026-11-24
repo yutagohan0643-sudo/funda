@@ -207,3 +207,23 @@ def test_promote_report():
     assert "826 銘柄から" in md and "**1 銘柄**" in md and "| 8508 Ｊトラスト | 1,000 |" in md
     assert "60点以上なら監視を続け" in md
     assert "基準を満たす銘柄なし" in promote.build([], pd.Timestamp("2026-11-28"), 10)
+
+
+def test_fresh_bars_refetches_then_drops_stale(monkeypatch):
+    import screener.__main__ as m
+
+    day = pd.Timestamp("2026-11-24")
+    good = pd.DataFrame({"Close": [1.0, 2.0]}, index=pd.to_datetime(["2026-11-20", "2026-11-24"]))
+    old = pd.DataFrame({"Close": [1.0]}, index=pd.to_datetime(["2026-11-20"]))
+    calls = []
+
+    def fake(codes):
+        calls.append(list(codes))
+        # A は2回目で最新になる。B はずっと古いまま
+        return {c: (good if c == "A" and len(calls) > 1 else (good if c == "C" else old)) for c in codes}
+
+    monkeypatch.setattr(m, "daily_bars", fake)
+    monkeypatch.setattr(m.time, "sleep", lambda s: None)
+    bars = m.fresh_bars(["A", "B", "C"], day, retries=2)
+    assert sorted(bars) == ["A", "C"]
+    assert calls[1] == ["A", "B"] and calls[2] == ["B"]

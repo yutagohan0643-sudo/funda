@@ -23,6 +23,8 @@ from .report import build, build_ranking
 SPARK_URL = "https://query1.finance.yahoo.com/v7/finance/spark"
 SPARK_BATCH = 20  # Yahoo の spark は1回20銘柄まで
 MAX_FUND_FETCH = 1500  # 1回の実行で決算データを問い合わせるのはこの銘柄数まで（残りは保存済みか「未確認」）
+STALE_RETRIES = 2  # 日足が最新の営業日まで届かない銘柄を取り直す回数
+STALE_WAIT = 60  # 取り直す前に待つ秒数
 MAX_FUND_FAIL = 5  # 続けてこの回数失敗したら、Yahoo に断られているとみて問い合わせをやめる
 FUND_INTERVAL = 3  # 決算データの問い合わせの間隔（秒）
 
@@ -116,6 +118,28 @@ def daily_bars(codes: list[str]) -> dict[str, pd.DataFrame]:
     return out
 
 
+def fresh_bars(codes: list[str], day: pd.Timestamp, retries: int = STALE_RETRIES) -> dict[str, pd.DataFrame]:
+    """日足を取り、最新の営業日 day まで届いていない銘柄は間をおいて取り直す。それでも古ければ外す。
+
+    Yahoo はときどき数日前までの日足しか返さないことがある。そのまま使うと、古い日のタッチを
+    「最新の営業日のタッチ」として数えてしまう（2026/11/25 の実行で 664 銘柄中 444 銘柄が 11/20 止まりだった）。
+    """
+    bars = daily_bars(codes)
+    for i in range(retries + 1):
+        stale = [c for c, df in bars.items() if df.empty or df.index[-1] < day]
+        if not stale:
+            break
+        if i == retries:
+            log(f"日足が {day:%m/%d} まで届かない銘柄を外す: {len(stale)} 銘柄（{', '.join(stale[:10])}{' など' if len(stale) > 10 else ''}）")
+            for c in stale:
+                bars.pop(c)
+            break
+        log(f"日足が {day:%m/%d} まで届かない銘柄を取り直す: {len(stale)} 銘柄（{i + 1}回目）")
+        time.sleep(STALE_WAIT)
+        bars.update(daily_bars(stale))
+    return bars
+
+
 def get_funds(codes: list[str], now: pd.Timestamp) -> dict[str, pd.DataFrame | None]:
     """保存済み（7日以内）の決算データを使い、なければ問い合わせて data/fundamentals に保存する。"""
     out, tried, fails = {}, 0, 0
@@ -166,7 +190,7 @@ def main(argv: list[str] | None = None) -> int:
     pre = core.pre_screen(closes, sigma=scan - core.PRE_MARGIN, lookback=args.days)
     log(f"一次ふるい（終値 -{scan - core.PRE_MARGIN:g}σ 以下）: {len(pre)} 銘柄")
 
-    bars = daily_bars(pre)
+    bars = fresh_bars(pre, data_day)
     touches = [t for code, df in bars.items()
                if (t := core.find_touch(code, df, sigma=scan, lookback=args.days, min_turnover=args.min_turnover * 1e4))]
     touches.sort(key=lambda t: t.low_sigma)
