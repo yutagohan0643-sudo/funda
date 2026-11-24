@@ -1,16 +1,16 @@
-name: 未発掘銘柄探し（週1回）
+name: 未発掘銘柄探し（平日の毎日）
 
 on:
   schedule:
-    # 毎週土曜 6:30（日本時間）。金曜までの1週間の値動き・開示で探す
-    - cron: "30 21 * * 5"
+    # 平日 19:00（日本時間）。その日の大引けの値動きと開示で探す（GitHub の混み具合で数分〜数十分遅れることがある）
+    - cron: "0 10 * * 1-5"
   workflow_dispatch: # GitHub の画面から手動でも実行できる
 
 permissions:
   contents: write
 
 concurrency:
-  group: weekly-screen
+  group: daily-screen
   cancel-in-progress: false
 
 jobs:
